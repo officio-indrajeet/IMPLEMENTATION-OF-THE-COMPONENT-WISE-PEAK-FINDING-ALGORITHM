@@ -1,3 +1,12 @@
+# ----------------------------------------------------------------------------
+# LEGACY - simplified early version, superseded by the `cpf` package.
+# Run from the repository root (it reads turkiye-student-evaluation_generic.csv
+# from the current directory).  Known problems (details: docs/CHANGES.md):
+#   * Optimized-CPF.py builds a UNION k-NN graph (edge if either point lists the
+#     other) instead of the mutual k-NN graph, treats Faiss' squared distances as
+#     Euclidean, and has no fallback big-brother search; n_jobs is unused.
+#   * ARI/AMI are computed against random labels.
+# ----------------------------------------------------------------------------
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler
@@ -8,39 +17,29 @@ from sklearn.metrics import adjusted_rand_score, adjusted_mutual_info_score, sil
 from sklearn.neighbors import NearestNeighbors
 import scipy.sparse
 import time
+import faiss
 
-# CPF functions
+# Optimized CPF functions
 
 
 def build_CCgraph(X, k, cutoff, n_jobs):
     """
-    Step 1: Compute G(X, E), the mutual k-nearest neighbor graph.
-
-    Parameters:
-    - X: Input data
-    - k: Number of neighbors
-    - cutoff: Cutoff for outlier detection
-    - n_jobs: Number of parallel jobs
-
-    Returns:
-    - components: Connected components of the graph
-    - CCmat: Adjacency matrix of the graph
-    - knn_radius: Radius of the k-nearest neighbors
+    Step 1: Compute G(X, E), the mutual k-nearest neighbor graph using FAISS for optimization.
     """
     n = X.shape[0]
-    # Fit k-nearest neighbors
-    kdt = NearestNeighbors(n_neighbors=k, metric='euclidean',
-                           n_jobs=n_jobs, algorithm='kd_tree').fit(X)
-    # Build the k-neighbors graph
-    CCmat = kdt.kneighbors_graph(X, mode='distance')
-    distances, _ = kdt.kneighbors(X)
+    index = faiss.IndexFlatL2(X.shape[1])  # Create FAISS index
+    index.add(X.astype(np.float32))  # Add data to the index
+    # Perform k-nearest neighbor search
+    distances, indices = index.search(X.astype(np.float32), k)
     knn_radius = distances[:, k-1]
-    # Symmetrize the graph
-    CCmat = CCmat.minimum(CCmat.T)
-    # Get connected components
+    # Initialize an empty sparse matrix
+    CCmat = scipy.sparse.lil_matrix((n, n))
+    for i in range(n):
+        for j in indices[i, :]:
+            CCmat[i, j] = 1
+            CCmat[j, i] = 1
     _, components = scipy.sparse.csgraph.connected_components(
         CCmat, directed=False, return_labels=True)
-    # Remove small components (outliers)
     comp_labs, comp_count = np.unique(components, return_counts=True)
     outlier_components = comp_labs[comp_count <= cutoff]
     nanidx = np.in1d(components, outlier_components)
@@ -52,18 +51,7 @@ def build_CCgraph(X, k, cutoff, n_jobs):
 
 def get_density_dists_bb(X, k, components, knn_radius, n_jobs):
     """
-    Step 2: Compute density distances and big brothers using mutual k-nearest neighbor graph.
-
-    Parameters:
-    - X: Input data
-    - k: Number of neighbors
-    - components: Connected components of the graph
-    - knn_radius: Radius of the k-nearest neighbors
-    - n_jobs: Number of parallel jobs
-
-    Returns:
-    - best_distance: Best density distance for each point
-    - big_brother: Big brother for each point
+    Step 2: Compute density distances and big brothers using mutual k-nearest neighbor graph with FAISS.
     """
     best_distance = np.empty((X.shape[0]))
     best_distance[:] = np.nan
@@ -75,9 +63,10 @@ def get_density_dists_bb(X, k, components, knn_radius, n_jobs):
         cc_idx = np.where(components == cc)[0]
         nc = len(cc_idx)
         kcc = min(k, nc-1)
-        kdt = NearestNeighbors(n_neighbors=kcc, metric='euclidean',
-                               n_jobs=n_jobs, algorithm='kd_tree').fit(X[cc_idx, :])
-        distances, neighbors = kdt.kneighbors(X[cc_idx, :])
+        index = faiss.IndexFlatL2(X.shape[1])  # Create FAISS index
+        index.add(X[cc_idx, :].astype(np.float32))  # Add data to the index
+        distances, neighbors = index.search(X[cc_idx, :].astype(
+            np.float32), kcc)  # Perform k-nearest neighbor search
         cc_knn_radius = knn_radius[cc_idx]
         cc_best_distance = np.empty((nc))
         cc_big_brother = np.empty((nc))
@@ -104,19 +93,6 @@ def get_density_dists_bb(X, k, components, knn_radius, n_jobs):
 def get_y(CCmat, components, knn_radius, best_distance, big_brother, rho, alpha, d):
     """
     Steps 3-26: Perform clustering based on density distances and big brothers.
-
-    Parameters:
-    - CCmat: Adjacency matrix of the graph
-    - components: Connected components of the graph
-    - knn_radius: Radius of the k-nearest neighbors
-    - best_distance: Best density distance for each point
-    - big_brother: Big brother for each point
-    - rho: Density threshold
-    - alpha: Alpha parameter for clustering
-    - d: Dimension of the data
-
-    Returns:
-    - y_pred: Predicted cluster labels
     """
     y_pred = np.empty((CCmat.shape[0]))
     y_pred[:] = np.nan
@@ -132,11 +108,11 @@ def get_y(CCmat, components, knn_radius, best_distance, big_brother, rho, alpha,
             n_cent += 1
             continue
 
-        # Sort the points according to their best distances
+        # Step 4: Sort the x's according to their γ values (here, best_distance)
         cc_best_distance = best_distance[cc_idx]
         cc_centers = []
 
-        # Find the initial center
+        # Step 5: Let x* = arg max_{x ∈ S} γ(x)
         cc_cut_idx = np.where(knn_radius[cc_idx] >= (
             rho * max(knn_radius[cc_idx])))[0]
         cc_centers.append(cc_cut_idx[np.argmax(cc_best_distance[cc_cut_idx])])
@@ -144,6 +120,7 @@ def get_y(CCmat, components, knn_radius, best_distance, big_brother, rho, alpha,
         not_tested = np.ones(nc, dtype=bool)
 
         while sum(not_tested) > 0:
+            # Step 9: Let x* = arg max_{x ∈ S} {γ(x) : x ∉ M}
             prop_cent = np.argmax(cc_best_distance * not_tested)
             if prop_cent not in cc_centers:
                 cc_centers.append(prop_cent)
@@ -165,23 +142,27 @@ def get_y(CCmat, components, knn_radius, best_distance, big_brother, rho, alpha,
         # Ensure indices are within bounds
         BBTree[BBTree[:, 1] >= nc, 1] = nc - 1
 
-        # Initialize the directed graph
+        # Step 17: Initialise G(S, E), a directed graph with S as vertices and no edges, E = ∅
         Clustmat = scipy.sparse.csr_matrix(
             (np.ones((nc)), (BBTree[:, 0], BBTree[:, 1])), shape=(nc, nc))
 
-        # Perform clustering
+        # Steps 18-20: for each x in S\M do, Add a directed edge from x to b(x), end for
+        # Step 21: for each cluster center x ∈ M do
         n_clusts, cc_y_pred = scipy.sparse.csgraph.connected_components(
             Clustmat, directed=True, return_labels=True)
 
+        # Step 22: Let C be the collection of the points connected by any directed path in G(S, E) that terminates at x.
+        # Step 23: Add C ∪ x to Ĉ.
         cc_y_pred += n_cent
         n_cent += n_clusts
         y_pred[cc_idx] = cc_y_pred
 
+    # Step 26: return Ĉ
     return y_pred
 
 
-class CPFcluster:
-    def __init__(self, k, rho=0.4, alpha=1, n_jobs=1, remove_duplicates=False, cutoff=1):
+class CPFclusterOptimized:
+    def __init__(self, k, rho=0.4, alpha=1, n_jobs=-1, remove_duplicates=False, cutoff=1):
         self.k = k
         self.rho = rho
         self.alpha = alpha
@@ -221,6 +202,10 @@ class CPFcluster:
         step3_time = time.time() - start_time
         print(f"Step 3: Get Y took {step3_time:.4f} seconds")
 
+        # Total time taken
+        total_time = step1_time + step2_time + step3_time
+        print(f"Total Time taken: {total_time:.4f} seconds")
+
 
 # Load the dataset
 file_path = 'turkiye-student-evaluation_generic.csv'
@@ -259,7 +244,6 @@ def plot_pca_2d(data, labels, title, file_name):
 
 
 def print_clustering_metrics(true_labels, predicted_labels):
-    # Removing NaN entries
     valid_indices = ~np.isnan(predicted_labels)
     true_labels = true_labels[valid_indices]
     predicted_labels = predicted_labels[valid_indices]
@@ -276,9 +260,11 @@ def print_clustering_metrics(true_labels, predicted_labels):
     print(f'Silhouette Score: {silhouette_avg:.6f}')
     print(f'Davies-Bouldin Index: {davies_bouldin:.6f}')
 
+    return valid_indices, ari, ami, silhouette_avg, davies_bouldin
+
 
 # Use the CPF cluster
-cpf_model = CPFcluster(k=10, rho=0.4, n_jobs=-1)
+cpf_model = CPFclusterOptimized(k=10, rho=0.4, n_jobs=-1)
 
 # Measure time taken
 start_time = time.time()
@@ -296,7 +282,8 @@ print(f"Number of clusters found: {num_clusters}")
 print(f"Total Time taken: {end_time - start_time:.2f} seconds")
 
 # Calculate and print clustering metrics
-print_clustering_metrics(true_labels, predicted_labels_cpf)
+valid_indices, ari_cpf, ami_cpf, silhouette_avg_cpf, davies_bouldin_cpf = print_clustering_metrics(
+    true_labels, predicted_labels_cpf)
 
 # Plot PCA results
 plot_pca_2d(data_normalized, predicted_labels_cpf,
