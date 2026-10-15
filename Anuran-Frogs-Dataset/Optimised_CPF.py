@@ -1,3 +1,12 @@
+# ----------------------------------------------------------------------------
+# LEGACY (dissertation version) - kept for reference only; use the `cpf` package.
+# Known problems in this file (details: docs/CHANGES.md):
+#   * build_CCgraph: kneighbors_graph(neighbors, ...) builds the graph from the
+#     n x k neighbour-INDEX array as if it were data, not from the Faiss result.
+#   * Faiss IndexFlatL2 returns SQUARED distances; they are used as Euclidean ones
+#     (and mixed with true Euclidean distances from the fallback search).
+#   * ARI/AMI are computed against random labels.
+# ----------------------------------------------------------------------------
 import numpy as np
 import pandas as pd
 import scipy.sparse
